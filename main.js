@@ -1,37 +1,86 @@
-// ─── RTC Share — WebRTC file transfer with QR signaling ─────────────────────
 import QRCode from 'qrcode';
 import jsQR from 'jsqr';
 
 const CHUNK = 64 * 1024;
-
 let pc = null, dc = null, role = 'offer';
 let sendQueue = [];
 let recvMeta = null, recvBufs = [], recvBytes = 0;
 
-// ── Compression helpers (SDP shrink for QR) ───────────────────────────────────
+// ── Compress / decompress SDP ─────────────────────────────────────────────────
 async function compress(str) {
   const bytes = new TextEncoder().encode(str);
   const cs = new CompressionStream('gzip');
-  const writer = cs.writable.getWriter();
-  writer.write(bytes); writer.close();
+  const w = cs.writable.getWriter();
+  w.write(bytes); w.close();
   const buf = await new Response(cs.readable).arrayBuffer();
   return btoa(String.fromCharCode(...new Uint8Array(buf)));
 }
-
 async function decompress(b64) {
   const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length).map((_, i) => bin.charCodeAt(i));
+  const bytes = Uint8Array.from(bin, c => c.charCodeAt(0));
   const ds = new DecompressionStream('gzip');
-  const writer = ds.writable.getWriter();
-  writer.write(bytes); writer.close();
+  const w = ds.writable.getWriter();
+  w.write(bytes); w.close();
   const buf = await new Response(ds.readable).arrayBuffer();
   return new TextDecoder().decode(buf);
+}
+
+// ── Split compressed string into N equal chunks ───────────────────────────────
+function splitChunks(str, n) {
+  const size = Math.ceil(str.length / n);
+  return Array.from({ length: n }, (_, i) => str.slice(i * size, (i + 1) * size));
+}
+
+// QR payload format: "rtcs:<partIndex>/<total>:<data>"
+const QR_PREFIX = 'rtcs:';
+function encodeQRPart(index, total, data) {
+  return `${QR_PREFIX}${index}/${total}:${data}`;
+}
+function decodeQRPart(raw) {
+  if (!raw.startsWith(QR_PREFIX)) return null;
+  const body = raw.slice(QR_PREFIX.length);
+  const slash = body.indexOf('/');
+  const colon = body.indexOf(':');
+  if (slash < 0 || colon < 0) return null;
+  return {
+    index: parseInt(body.slice(0, slash)),
+    total: parseInt(body.slice(slash + 1, colon)),
+    data:  body.slice(colon + 1),
+  };
+}
+
+// ── Render dual QR codes ──────────────────────────────────────────────────────
+async function showDualQR(containerId, compressed) {
+  const parts = splitChunks(compressed, 2);
+  const container = document.getElementById(containerId);
+  container.innerHTML = '';
+  container.classList.remove('hidden');
+
+  for (let i = 0; i < parts.length; i++) {
+    const payload = encodeQRPart(i, parts.length, parts[i]);
+    const wrap = document.createElement('div');
+    wrap.className = 'qr-block';
+    wrap.innerHTML = `<div class="qr-num">QR ${i + 1} of ${parts.length}</div>`;
+    const canvas = document.createElement('canvas');
+    wrap.appendChild(canvas);
+    const byteLen = Math.round(payload.length * 0.75);
+    wrap.innerHTML += `<div class="qr-sub">${payload.length} chars · ${byteLen}B</div>`;
+    container.appendChild(wrap);
+    // Re-append canvas after innerHTML wipe
+    wrap.insertBefore(canvas, wrap.querySelector('.qr-sub'));
+    await QRCode.toCanvas(canvas, payload, {
+      errorCorrectionLevel: 'M',
+      width: 220,
+      margin: 2,
+      color: { dark: '#e0e0ee', light: '#0d0d14' }
+    });
+  }
 }
 
 // ── UI helpers ────────────────────────────────────────────────────────────────
 function log(msg, cls = '') {
   const el = document.getElementById('log');
-  el.innerHTML += `<div class="${cls}">${msg}</div>`;
+  el.innerHTML += `<div class="${cls}">${escHtml(msg)}</div>`;
   el.scrollTop = el.scrollHeight;
 }
 function setStatus(state) {
@@ -42,62 +91,65 @@ function showSections(on) {
   document.getElementById('section-send').classList.toggle('hidden', !on);
   document.getElementById('section-recv').classList.toggle('hidden', !on);
 }
-
 window.copyText = (id) => {
-  const el = document.getElementById(id);
-  navigator.clipboard.writeText(el.value).then(() => log('copied ✓', 'ok'));
+  navigator.clipboard.writeText(document.getElementById(id).value)
+    .then(() => log('copied ✓', 'ok'));
 };
-
 window.setRole = (r) => {
   role = r;
-  document.getElementById('tabOffer').classList.toggle('active', r === 'offer');
-  document.getElementById('tabAnswer').classList.toggle('active', r === 'answer');
+  ['tabOffer','tabAnswer'].forEach(id =>
+    document.getElementById(id).classList.toggle('active', id === 'tab' + (r === 'offer' ? 'Offer' : 'Answer'))
+  );
   document.getElementById('offerFlow').classList.toggle('hidden', r !== 'offer');
   document.getElementById('answerFlow').classList.toggle('hidden', r !== 'answer');
 };
 
-// ── QR Code display ───────────────────────────────────────────────────────────
-async function showQR(canvasId, data) {
-  const canvas = document.getElementById(canvasId);
-  canvas.classList.remove('hidden');
-  await QRCode.toCanvas(canvas, data, {
-    errorCorrectionLevel: 'L',
-    width: 240,
-    margin: 2,
-    color: { dark: '#e0e0ee', light: '#0d0d14' }
-  });
+// ── QR Scanner (multi-part aware) ─────────────────────────────────────────────
+let scanActive = false, scanStream = null;
+let scanTarget = null;           // 'offer' | 'answer'
+let collectedParts = {};         // { index: data }
+let expectedTotal = null;
+
+function resetScan() {
+  collectedParts = {};
+  expectedTotal = null;
 }
 
-// ── QR Scanner ───────────────────────────────────────────────────────────────
-let scanActive = false;
-let scanStream = null;
-let scanTarget = null; // 'offer' | 'answer'
+function scanProgress() {
+  const got = Object.keys(collectedParts).length;
+  const total = expectedTotal || '?';
+  return { got, total };
+}
 
 window.startScan = async (target) => {
   scanTarget = target;
+  resetScan();
+  updateScanUI();
+
   const modal = document.getElementById('scanModal');
   modal.classList.remove('hidden');
   const video = document.getElementById('scanVideo');
-  const status = document.getElementById('scanStatus');
+
+  setScanStatus('Starting camera…', 'info');
 
   try {
     scanStream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: 'environment' }
+      video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
     });
     video.srcObject = scanStream;
     await video.play();
     scanActive = true;
-    status.textContent = 'scanning…';
+    setScanStatus('Point at QR 1 of 2…', 'info');
     requestAnimationFrame(scanFrame);
   } catch (e) {
-    status.textContent = 'camera error: ' + e.message;
+    setScanStatus('❌ Camera error: ' + e.message, 'err');
   }
 };
 
 async function scanFrame() {
   if (!scanActive) return;
   const video = document.getElementById('scanVideo');
-  if (video.readyState !== video.HAVE_ENOUGH_DATA) {
+  if (video.readyState < video.HAVE_ENOUGH_DATA) {
     requestAnimationFrame(scanFrame); return;
   }
   const canvas = document.createElement('canvas');
@@ -105,39 +157,129 @@ async function scanFrame() {
   canvas.height = video.videoHeight;
   canvas.getContext('2d').drawImage(video, 0, 0);
   const img = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height);
-  const code = jsQR(img.data, img.width, img.height, { inversionAttempts: 'dontInvert' });
+
+  let code = null;
+  try {
+    code = jsQR(img.data, img.width, img.height, { inversionAttempts: 'attemptBoth' });
+  } catch(e) {
+    setScanStatus('❌ Scan decode error: ' + e.message, 'err');
+    requestAnimationFrame(scanFrame);
+    return;
+  }
 
   if (code) {
+    const part = decodeQRPart(code.data);
+
+    if (!part) {
+      setScanStatus('⚠️ Not an rtcshare QR — try again', 'warn');
+      await sleep(1200);
+      setScanStatus('Scanning… point at the QR code', 'info');
+      requestAnimationFrame(scanFrame);
+      return;
+    }
+
+    // Validate total consistency
+    if (expectedTotal !== null && part.total !== expectedTotal) {
+      setScanStatus('⚠️ QR mismatch — wrong session? Restart scan', 'warn');
+      await sleep(1500);
+      requestAnimationFrame(scanFrame);
+      return;
+    }
+
+    expectedTotal = part.total;
+
+    if (collectedParts[part.index] !== undefined) {
+      // Already have this part — guide to next
+      const { got, total } = scanProgress();
+      const missing = getMissing();
+      setScanStatus(`Already have QR ${part.index + 1} — scan QR ${missing[0] + 1}`, 'warn');
+      await sleep(900);
+      requestAnimationFrame(scanFrame);
+      return;
+    }
+
+    // Accept this part
+    collectedParts[part.index] = part.data;
+    updateScanUI();
+
+    const { got, total } = scanProgress();
+
+    if (got < total) {
+      const missing = getMissing();
+      setScanStatus(`✓ Got QR ${part.index + 1} — now scan QR ${missing[0] + 1}`, 'ok');
+      requestAnimationFrame(scanFrame);
+      return;
+    }
+
+    // All parts collected
+    setScanStatus('✓ All QRs scanned — assembling…', 'ok');
     stopScan();
-    document.getElementById('scanStatus').textContent = 'got it ✓';
+
     try {
-      const sdpJson = await decompress(code.data);
+      const assembled = Array.from({ length: total }, (_, i) => collectedParts[i]).join('');
+      const sdpJson = await decompress(assembled);
+
+      // Validate it's real SDP JSON
+      const parsed = JSON.parse(sdpJson);
+      if (!parsed.type || !parsed.sdp) throw new Error('Invalid SDP structure');
+
       if (scanTarget === 'offer') {
         document.getElementById('offerInput').value = sdpJson;
-        log('scanned offer QR ✓', 'ok');
+        log('scanned offer (2 QRs) ✓', 'ok');
       } else {
         document.getElementById('answerInput').value = sdpJson;
-        log('scanned answer QR ✓', 'ok');
+        log('scanned answer (2 QRs) ✓', 'ok');
       }
+      await sleep(600);
       closeScan();
-    } catch(e) {
-      document.getElementById('scanStatus').textContent = 'decode error';
+    } catch (e) {
+      setScanStatus('❌ Decode failed: ' + e.message + ' — restart scan', 'err');
+      resetScan();
+      updateScanUI();
+      scanActive = true;
+      requestAnimationFrame(scanFrame);
     }
     return;
   }
+
   requestAnimationFrame(scanFrame);
+}
+
+function getMissing() {
+  const total = expectedTotal || 2;
+  return Array.from({ length: total }, (_, i) => i).filter(i => collectedParts[i] === undefined);
+}
+
+function updateScanUI() {
+  const total = expectedTotal || 2;
+  const indicators = document.getElementById('scanIndicators');
+  indicators.innerHTML = '';
+  for (let i = 0; i < total; i++) {
+    const dot = document.createElement('div');
+    dot.className = 'scan-dot ' + (collectedParts[i] !== undefined ? 'got' : 'waiting');
+    dot.textContent = `QR ${i + 1}`;
+    indicators.appendChild(dot);
+  }
+}
+
+function setScanStatus(msg, cls = '') {
+  const el = document.getElementById('scanStatus');
+  el.textContent = msg;
+  el.className = 'scan-status ' + cls;
 }
 
 function stopScan() {
   scanActive = false;
   if (scanStream) { scanStream.getTracks().forEach(t => t.stop()); scanStream = null; }
 }
-
 window.closeScan = () => {
-  stopScan();
+  stopScan(); resetScan();
   document.getElementById('scanModal').classList.add('hidden');
   document.getElementById('scanVideo').srcObject = null;
+  document.getElementById('scanIndicators').innerHTML = '';
 };
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ── WebRTC core ───────────────────────────────────────────────────────────────
 function makePeer() {
@@ -146,18 +288,23 @@ function makePeer() {
   pc.onicegatheringstatechange = async () => {
     if (pc.iceGatheringState !== 'complete') return;
     const sdpJson = JSON.stringify(pc.localDescription);
-    const compressed = await compress(sdpJson);
-
+    let compressed;
+    try {
+      compressed = await compress(sdpJson);
+    } catch(e) {
+      log('compress error: ' + e.message, 'err'); return;
+    }
+    log(`SDP compressed: ${sdpJson.length} → ${compressed.length} chars`, 'info');
     if (role === 'offer') {
       document.getElementById('offerSDP').value = sdpJson;
       document.getElementById('offerOut').classList.remove('hidden');
-      await showQR('offerQR', compressed);
-      log('offer QR ready — scan on receiver', 'info');
+      await showDualQR('offerQRContainer', compressed);
+      log('offer QRs ready — scan QR 1 then QR 2 on receiver', 'info');
     } else {
       document.getElementById('answerSDP').value = sdpJson;
       document.getElementById('answerOut').classList.remove('hidden');
-      await showQR('answerQR', compressed);
-      log('answer QR ready — scan on sender', 'info');
+      await showDualQR('answerQRContainer', compressed);
+      log('answer QRs ready — scan QR 1 then QR 2 on sender', 'info');
     }
   };
   pc.onconnectionstatechange = () => {
@@ -168,8 +315,7 @@ function makePeer() {
     }
     if (['failed','disconnected','closed'].includes(pc.connectionState)) setStatus('idle');
   };
-  pc.ondatachannel = (e) => setupChannel(e.channel);
-  return pc;
+  pc.ondatachannel = e => setupChannel(e.channel);
 }
 
 function setupChannel(ch) {
@@ -177,30 +323,36 @@ function setupChannel(ch) {
   dc.binaryType = 'arraybuffer';
   dc.onopen = () => log('data channel open ✓', 'ok');
   dc.onmessage = onMessage;
-  dc.onerror = (e) => log('dc error: ' + e.message, 'err');
+  dc.onerror = e => log('dc error: ' + e.message, 'err');
 }
 
 window.createOffer = async () => {
   setStatus('connecting'); makePeer();
   setupChannel(pc.createDataChannel('files'));
-  await pc.setLocalDescription(await pc.createOffer());
-  log('gathering ICE…');
+  try {
+    await pc.setLocalDescription(await pc.createOffer());
+    log('gathering ICE…');
+  } catch(e) { log('offer error: ' + e.message, 'err'); }
 };
 
 window.createAnswer = async () => {
   const raw = document.getElementById('offerInput').value.trim();
-  if (!raw) { log('paste or scan offer first', 'err'); return; }
+  if (!raw) { log('scan or paste offer first', 'err'); return; }
   setStatus('connecting'); makePeer();
-  await pc.setRemoteDescription(JSON.parse(raw));
-  await pc.setLocalDescription(await pc.createAnswer());
-  log('gathering ICE…');
+  try {
+    await pc.setRemoteDescription(JSON.parse(raw));
+    await pc.setLocalDescription(await pc.createAnswer());
+    log('gathering ICE…');
+  } catch(e) { log('answer error: ' + e.message, 'err'); setStatus('idle'); }
 };
 
 window.applyAnswer = async () => {
   const raw = document.getElementById('answerInput').value.trim();
-  if (!raw) { log('paste or scan answer first', 'err'); return; }
-  await pc.setRemoteDescription(JSON.parse(raw));
-  log('applying answer…', 'info');
+  if (!raw) { log('scan or paste answer first', 'err'); return; }
+  try {
+    await pc.setRemoteDescription(JSON.parse(raw));
+    log('applying answer…', 'info');
+  } catch(e) { log('apply answer error: ' + e.message, 'err'); }
 };
 
 // ── File sending ──────────────────────────────────────────────────────────────
@@ -208,7 +360,18 @@ window.addFiles = (files) => {
   for (const f of files) {
     const id = crypto.randomUUID();
     sendQueue.push({ file: f, id });
-    renderSendItem(f, id);
+    const el = document.createElement('div');
+    el.className = 'file-item'; el.id = 'fi-' + id;
+    el.innerHTML = `
+      <div class="file-icon">${fileIcon(f.name)}</div>
+      <div class="file-info">
+        <div class="file-name">${escHtml(f.name)}</div>
+        <div class="file-size">${fmtSize(f.size)}</div>
+        <div class="file-progress"><div class="file-progress-bar" id="pb-${id}"></div></div>
+      </div>
+      <div class="file-status waiting" id="fs-${id}">queued</div>
+      <button class="btn-rm" onclick="removeFile('${id}')">×</button>`;
+    document.getElementById('fileList').appendChild(el);
   }
   document.getElementById('btnSend').disabled = sendQueue.length === 0;
 };
@@ -217,20 +380,6 @@ window.clearFiles = () => {
   document.getElementById('fileList').innerHTML = '';
   document.getElementById('btnSend').disabled = true;
 };
-function renderSendItem(file, id) {
-  const el = document.createElement('div');
-  el.className = 'file-item'; el.id = 'fi-' + id;
-  el.innerHTML = `
-    <div class="file-icon">${fileIcon(file.name)}</div>
-    <div class="file-info">
-      <div class="file-name">${escHtml(file.name)}</div>
-      <div class="file-size">${fmtSize(file.size)}</div>
-      <div class="file-progress"><div class="file-progress-bar" id="pb-${id}"></div></div>
-    </div>
-    <div class="file-status waiting" id="fs-${id}">queued</div>
-    <button class="btn-rm" onclick="removeFile('${id}')">×</button>`;
-  document.getElementById('fileList').appendChild(el);
-}
 window.removeFile = (id) => {
   sendQueue = sendQueue.filter(x => x.id !== id);
   document.getElementById('fi-' + id)?.remove();
@@ -243,22 +392,22 @@ window.sendFiles = async () => {
   log('all files sent ✓', 'ok');
 };
 async function sendFile(file, id) {
-  const statusEl = document.getElementById('fs-' + id);
-  const barEl = document.getElementById('pb-' + id);
-  statusEl.className = 'file-status sending'; statusEl.textContent = 'sending';
+  const sEl = document.getElementById('fs-' + id);
+  const bEl = document.getElementById('pb-' + id);
+  sEl.className = 'file-status sending'; sEl.textContent = 'sending';
   dc.send(JSON.stringify({ type: 'meta', name: file.name, size: file.size, mime: file.type }));
   const buf = await file.arrayBuffer();
   let offset = 0;
   while (offset < buf.byteLength) {
-    while (dc.bufferedAmount > 1024 * 1024) await new Promise(r => setTimeout(r, 20));
+    while (dc.bufferedAmount > 1024 * 1024) await sleep(20);
     const end = Math.min(offset + CHUNK, buf.byteLength);
     dc.send(buf.slice(offset, end));
     offset = end;
     const pct = Math.round(offset / buf.byteLength * 100);
-    barEl.style.width = pct + '%'; statusEl.textContent = pct + '%';
+    bEl.style.width = pct + '%'; sEl.textContent = pct + '%';
   }
   dc.send(JSON.stringify({ type: 'done' }));
-  statusEl.className = 'file-status done'; statusEl.textContent = '✓ sent';
+  sEl.className = 'file-status done'; sEl.textContent = '✓ sent';
   log(`sent: ${file.name}`, 'ok');
 }
 
@@ -291,23 +440,23 @@ function finalizeRecv() {
 }
 
 // ── Drag & Drop ───────────────────────────────────────────────────────────────
-const dropZone = document.getElementById('dropZone');
-dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
-dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
-dropZone.addEventListener('drop', e => { e.preventDefault(); dropZone.classList.remove('drag-over'); addFiles(e.dataTransfer.files); });
+const dz = document.getElementById('dropZone');
+dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag-over'); });
+dz.addEventListener('dragleave', () => dz.classList.remove('drag-over'));
+dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('drag-over'); addFiles(e.dataTransfer.files); });
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function fmtSize(b) {
   if (b < 1024) return b + ' B';
-  if (b < 1024**2) return (b/1024).toFixed(1) + ' KB';
-  if (b < 1024**3) return (b/1024**2).toFixed(1) + ' MB';
-  return (b/1024**3).toFixed(2) + ' GB';
+  if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
+  if (b < 1073741824) return (b/1048576).toFixed(1) + ' MB';
+  return (b/1073741824).toFixed(2) + ' GB';
 }
 function escHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 function fileIcon(name) {
-  const ext = name.split('.').pop().toLowerCase();
-  const m = { jpg:'🖼️',jpeg:'🖼️',png:'🖼️',gif:'🖼️',webp:'🖼️',svg:'🖼️',mp4:'🎬',mov:'🎬',mkv:'🎬',webm:'🎬',mp3:'🎵',wav:'🎵',flac:'🎵',pdf:'📄',doc:'📝',docx:'📝',txt:'📝',md:'📝',zip:'📦',rar:'📦','7z':'📦',js:'💻',ts:'💻',py:'💻',html:'💻',json:'💻' };
+  const ext = (name.split('.').pop()||'').toLowerCase();
+  const m = {jpg:'🖼️',jpeg:'🖼️',png:'🖼️',gif:'🖼️',webp:'🖼️',svg:'🖼️',mp4:'🎬',mov:'🎬',mkv:'🎬',webm:'🎬',mp3:'🎵',wav:'🎵',flac:'🎵',pdf:'📄',doc:'📝',docx:'📝',txt:'📝',md:'📝',zip:'📦',rar:'📦','7z':'📦',js:'💻',ts:'💻',py:'💻',html:'💻',json:'💻'};
   return m[ext] || '📎';
 }
