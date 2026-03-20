@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RTC Share</title>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #0a0a0f; --surface: #111118; --border: #1e1e2e;
+      --accent: #00ff88; --accent2: #0088ff; --warn: #ff6b35;
+      --text: #e0e0ee; --muted: #555570;
+      --mono: 'IBM Plex Mono', monospace; --sans: 'IBM Plex Sans', sans-serif;
+    }
+    body { background:var(--bg); color:var(--text); font-family:var(--sans); min-height:100dvh; display:flex; flex-direction:column; align-items:center; padding:20px 16px 40px; }
+    header { width:100%; max-width:560px; padding:24px 0 20px; display:flex; align-items:center; gap:12px; border-bottom:1px solid var(--border); margin-bottom:28px; }
+    .logo { width:36px; height:36px; background:var(--accent); border-radius:8px; display:grid; place-items:center; flex-shrink:0; }
+    h1 { font-family:var(--mono); font-size:1.1rem; font-weight:600; letter-spacing:.04em; }
+    h1 span { color:var(--accent); }
+    .status-dot { margin-left:auto; display:flex; align-items:center; gap:7px; font-family:var(--mono); font-size:.7rem; color:var(--muted); }
+    .dot { width:7px; height:7px; border-radius:50%; background:var(--muted); transition:background .3s; }
+    .dot.connected { background:var(--accent); box-shadow:0 0 8px var(--accent); }
+    .dot.connecting { background:var(--warn); animation:pulse 1s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+    main { width:100%; max-width:560px; display:flex; flex-direction:column; gap:20px; }
+    .card { background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:20px; }
+    .card-title { font-family:var(--mono); font-size:.72rem; font-weight:500; color:var(--muted); text-transform:uppercase; letter-spacing:.1em; margin-bottom:14px; display:flex; align-items:center; gap:8px; }
+    .card-title::before { content:''; display:inline-block; width:3px; height:12px; background:var(--accent); border-radius:2px; }
+    .role-tabs { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:20px; }
+    .tab { padding:10px; border:1px solid var(--border); border-radius:8px; background:transparent; color:var(--muted); font-family:var(--mono); font-size:.8rem; cursor:pointer; transition:all .15s; text-align:center; }
+    .tab.active { border-color:var(--accent); color:var(--accent); background:rgba(0,255,136,.06); }
+    .tab:hover:not(.active) { border-color:#333350; color:var(--text); }
+    textarea { width:100%; background:#0d0d14; border:1px solid var(--border); border-radius:8px; color:var(--text); font-family:var(--mono); font-size:.72rem; line-height:1.5; padding:12px; resize:vertical; min-height:80px; outline:none; transition:border-color .15s; }
+    textarea:focus { border-color:var(--accent2); }
+    textarea::placeholder { color:var(--muted); }
+    .btn { display:inline-flex; align-items:center; justify-content:center; gap:7px; padding:10px 18px; border-radius:8px; border:none; cursor:pointer; font-family:var(--mono); font-size:.78rem; font-weight:500; transition:all .15s; white-space:nowrap; }
+    .btn-primary { background:var(--accent); color:#000; }
+    .btn-primary:hover { background:#00e67a; }
+    .btn-secondary { background:transparent; color:var(--text); border:1px solid var(--border); }
+    .btn-secondary:hover { border-color:#444460; background:rgba(255,255,255,.03); }
+    .btn-scan { background:transparent; color:var(--accent2); border:1px solid var(--accent2); }
+    .btn-scan:hover { background:rgba(0,136,255,.08); }
+    .btn:disabled { opacity:.35; cursor:not-allowed; }
+    .row { display:flex; gap:8px; align-items:flex-start; margin-top:10px; flex-wrap:wrap; }
+    .row textarea { flex:1; min-width:180px; }
+    .row-btns { display:flex; flex-direction:column; gap:6px; }
+
+    /* QR display */
+    .qr-wrap { display:flex; flex-direction:column; align-items:center; gap:10px; margin-top:14px; padding:16px; background:#0d0d14; border:1px solid var(--border); border-radius:10px; }
+    .qr-label { font-family:var(--mono); font-size:.68rem; color:var(--muted); }
+    canvas.hidden { display:none; }
+
+    /* Scan modal */
+    .modal-overlay { position:fixed; inset:0; background:rgba(0,0,0,.85); display:flex; align-items:center; justify-content:center; z-index:100; padding:20px; }
+    .modal { background:var(--surface); border:1px solid var(--border); border-radius:16px; padding:20px; width:100%; max-width:380px; display:flex; flex-direction:column; gap:14px; }
+    .modal-title { font-family:var(--mono); font-size:.85rem; font-weight:600; color:var(--text); display:flex; justify-content:space-between; align-items:center; }
+    #scanVideo { width:100%; border-radius:10px; background:#000; aspect-ratio:1; object-fit:cover; }
+    #scanStatus { font-family:var(--mono); font-size:.72rem; color:var(--muted); text-align:center; }
+
+    /* File items */
+    .drop-zone { border:2px dashed var(--border); border-radius:10px; padding:28px 20px; text-align:center; cursor:pointer; transition:all .2s; position:relative; }
+    .drop-zone.drag-over { border-color:var(--accent); background:rgba(0,255,136,.04); }
+    .drop-zone input[type=file] { position:absolute; inset:0; opacity:0; cursor:pointer; width:100%; height:100%; }
+    .drop-icon { font-size:1.8rem; margin-bottom:6px; }
+    .drop-label { font-family:var(--mono); font-size:.75rem; color:var(--muted); }
+    .drop-label strong { color:var(--text); }
+    .file-list { display:flex; flex-direction:column; gap:8px; margin-top:14px; }
+    .file-item { display:flex; align-items:center; gap:10px; background:#0d0d14; border:1px solid var(--border); border-radius:8px; padding:10px 12px; }
+    .file-icon { font-size:1.2rem; flex-shrink:0; }
+    .file-info { flex:1; min-width:0; }
+    .file-name { font-family:var(--mono); font-size:.75rem; color:var(--text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .file-size { font-size:.68rem; color:var(--muted); font-family:var(--mono); margin-top:2px; }
+    .file-progress { height:3px; background:var(--border); border-radius:2px; margin-top:6px; overflow:hidden; }
+    .file-progress-bar { height:100%; background:var(--accent); border-radius:2px; transition:width .1s; width:0%; }
+    .file-status { font-family:var(--mono); font-size:.65rem; flex-shrink:0; }
+    .file-status.done { color:var(--accent); }
+    .file-status.sending { color:var(--warn); animation:pulse 1s infinite; }
+    .file-status.waiting { color:var(--muted); }
+    .btn-rm { background:none; border:none; color:var(--muted); cursor:pointer; padding:2px 6px; font-size:1rem; flex-shrink:0; }
+    .btn-rm:hover { color:var(--warn); }
+    .recv-item { display:flex; align-items:center; gap:10px; background:rgba(0,255,136,.04); border:1px solid rgba(0,255,136,.15); border-radius:8px; padding:10px 12px; animation:fadeIn .3s ease; }
+    @keyframes fadeIn { from{opacity:0;transform:translateY(4px)} to{opacity:1;transform:none} }
+    .recv-info { flex:1; min-width:0; }
+    .recv-name { font-family:var(--mono); font-size:.75rem; color:var(--text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .recv-size { font-size:.68rem; color:var(--muted); font-family:var(--mono); margin-top:2px; }
+    .log { font-family:var(--mono); font-size:.68rem; color:var(--muted); line-height:1.8; max-height:100px; overflow-y:auto; padding:10px; background:#0d0d14; border:1px solid var(--border); border-radius:8px; margin-top:14px; }
+    .log .ok { color:var(--accent); } .log .err { color:var(--warn); } .log .info { color:var(--accent2); }
+    .hidden { display:none !important; }
+    .tip { font-size:.72rem; color:var(--muted); font-family:var(--mono); margin-top:8px; line-height:1.6; }
+    .tip b { color:var(--text); }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+      <circle cx="10" cy="10" r="7" stroke="#000" stroke-width="1.5"/>
+      <path d="M7 10l2 2 4-4" stroke="#000" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+  </div>
+  <h1>rtc<span>share</span></h1>
+  <div class="status-dot">
+    <div class="dot" id="connDot"></div>
+    <span id="connLabel">idle</span>
+  </div>
+</header>
+
+<main>
+
+  <!-- STEP 1: CONNECT -->
+  <div class="card" id="section-connect">
+    <div class="card-title">01 — connection setup</div>
+    <div class="role-tabs">
+      <button class="tab active" id="tabOffer" onclick="setRole('offer')">📡 Sender (offer)</button>
+      <button class="tab" id="tabAnswer" onclick="setRole('answer')">📥 Receiver (answer)</button>
+    </div>
+
+    <!-- OFFER FLOW -->
+    <div id="offerFlow">
+      <button class="btn btn-primary" onclick="createOffer()">Generate Offer</button>
+      <div id="offerOut" class="hidden">
+        <div class="qr-wrap">
+          <div class="qr-label">📱 Scan this on the receiver's device</div>
+          <canvas id="offerQR" class="hidden"></canvas>
+        </div>
+        <details style="margin-top:10px">
+          <summary style="font-family:var(--mono);font-size:.7rem;color:var(--muted);cursor:pointer">or copy SDP manually</summary>
+          <div class="row" style="margin-top:8px">
+            <textarea id="offerSDP" rows="3" readonly></textarea>
+            <button class="btn btn-secondary" onclick="copyText('offerSDP')">copy</button>
+          </div>
+        </details>
+        <p class="tip" style="margin-top:14px"><b>After scan:</b> receiver generates answer → you scan their answer QR below.</p>
+        <p class="tip" style="margin-top:6px"><b>Paste their answer</b> or scan:</p>
+        <div class="row" style="margin-top:8px">
+          <textarea id="answerInput" rows="2" placeholder="paste answer SDP… or scan QR →"></textarea>
+          <div class="row-btns">
+            <button class="btn btn-scan" onclick="startScan('answer')">📷 scan</button>
+            <button class="btn btn-primary" onclick="applyAnswer()">connect</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ANSWER FLOW -->
+    <div id="answerFlow" class="hidden">
+      <p class="tip"><b>Scan the sender's offer QR</b> or paste manually:</p>
+      <div class="row" style="margin-top:8px">
+        <textarea id="offerInput" rows="2" placeholder="paste offer SDP… or scan QR →"></textarea>
+        <div class="row-btns">
+          <button class="btn btn-scan" onclick="startScan('offer')">📷 scan</button>
+          <button class="btn btn-primary" onclick="createAnswer()">generate answer</button>
+        </div>
+      </div>
+      <div id="answerOut" class="hidden" style="margin-top:14px">
+        <div class="qr-wrap">
+          <div class="qr-label">📱 Scan this on the sender's device</div>
+          <canvas id="answerQR" class="hidden"></canvas>
+        </div>
+        <details style="margin-top:10px">
+          <summary style="font-family:var(--mono);font-size:.7rem;color:var(--muted);cursor:pointer">or copy SDP manually</summary>
+          <div class="row" style="margin-top:8px">
+            <textarea id="answerSDP" rows="3" readonly></textarea>
+            <button class="btn btn-secondary" onclick="copyText('answerSDP')">copy</button>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="log" id="log">waiting...</div>
+  </div>
+
+  <!-- STEP 2: SEND FILES -->
+  <div class="card hidden" id="section-send">
+    <div class="card-title">02 — send files</div>
+    <div class="drop-zone" id="dropZone">
+      <input type="file" id="fileInput" multiple onchange="addFiles(this.files)" />
+      <div class="drop-icon">📂</div>
+      <div class="drop-label"><strong>Drop files</strong> or tap to browse</div>
+    </div>
+    <div class="file-list" id="fileList"></div>
+    <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn btn-primary" id="btnSend" onclick="sendFiles()" disabled>Send All</button>
+      <button class="btn btn-secondary" onclick="clearFiles()">Clear</button>
+    </div>
+  </div>
+
+  <!-- STEP 3: RECEIVED FILES -->
+  <div class="card hidden" id="section-recv">
+    <div class="card-title">03 — received files</div>
+    <div class="file-list" id="recvList"><p class="tip">Files received will appear here for download.</p></div>
+  </div>
+
+</main>
+
+<!-- QR SCAN MODAL -->
+<div class="modal-overlay hidden" id="scanModal">
+  <div class="modal">
+    <div class="modal-title">
+      <span>📷 scan QR code</span>
+      <button class="btn btn-secondary" style="padding:6px 12px" onclick="closeScan()">✕ close</button>
+    </div>
+    <video id="scanVideo" autoplay playsinline muted></video>
+    <div id="scanStatus">initializing camera…</div>
+  </div>
+</div>
+
+<script type="module" src="/main.js"></script>
+</body>
+</html>
